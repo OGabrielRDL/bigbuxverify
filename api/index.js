@@ -308,6 +308,22 @@ async function discordFetch(url, options = {}) {
   return data;
 }
 
+async function exchangeDiscordOAuthCode(code) {
+  const basic = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
+  return discordFetch('https://discord.com/api/oauth2/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: `Basic ${basic}`
+    },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: REDIRECT_URI
+    })
+  });
+}
+
 async function inspectDiscordOAuthToken(accessToken) {
   const data = await discordFetch('https://discord.com/api/oauth2/@me', {
     headers: { Authorization: `Bearer ${accessToken}` }
@@ -418,8 +434,12 @@ function renderResultPage({ ok, title, message, user, guildId }) {
     <section class="card result-card ${ok ? 'success' : 'error'}">
       <div class="orb orb-one"></div>
       <div class="orb orb-two"></div>
-      <img class="mini-banner" src="/logo.gif" alt="BigBux" />
-      <img class="avatar" src="${htmlEscape(avatar)}" alt="Avatar Discord" />
+      <div class="result-identity" aria-hidden="true">
+        <span class="identity-logo"><img src="/assets/bigbux-logo.png" alt="" /></span>
+        <span class="identity-line"></span>
+        <span class="identity-avatar"><img src="${htmlEscape(avatar)}" alt="" /></span>
+      </div>
+      <div class="result-status-icon">${ok ? '&#10003;' : '!'}</div>
       <p class="eyebrow">BigBux Verify</p>
       <h1>${safeTitle}</h1>
       <p class="muted">${safeMessage}</p>
@@ -518,17 +538,7 @@ async function handleAuthCallback(req, res) {
     }
     const guildId = parsedState.guildId;
 
-    const token = await discordFetch('https://discord.com/api/oauth2/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: REDIRECT_URI
-      })
-    });
+    const token = await exchangeDiscordOAuthCode(code);
 
     if (!token.access_token) {
       throw new Error('Discord não retornou access_token. Tente verificar novamente.');
