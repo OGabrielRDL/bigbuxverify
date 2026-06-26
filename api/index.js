@@ -29,7 +29,7 @@ const CLIENT_ID = firstEnv(['DISCORD_CLIENT_ID', 'DISCORD_OAUTH_CLIENT_ID']);
 const CLIENT_SECRET = firstEnv(['DISCORD_CLIENT_SECRET', 'DISCORD_OAUTH_CLIENT_SECRET']);
 const BOT_TOKEN = firstEnv(['SITE_DISCORD_BOT_TOKEN', 'DISCORD_BOT_TOKEN', 'DISCORD_TOKEN', 'BOT_TOKEN', 'TOKEN']);
 const DEFAULT_GUILD_ID = firstEnv(['DISCORD_GUILD_ID', 'ALLOWED_GUILD_ID', 'GUILD_ID']);
-const VERIFIED_ROLE_ID = firstEnv(['DISCORD_VERIFIED_ROLE_ID', 'VERIFIED_ROLE_ID', 'VERIFY_ROLE_ID', 'AUTH_ROLE_ID']);
+const VERIFIED_ROLE_ID = firstEnv(['DISCORD_VERIFIED_ROLE_ID', 'VERIFIED_ROLE_ID', 'VERIFY_ROLE_ID', 'AUTH_ROLE_ID'], '1508197241696026817');
 const SCOPES = cleanEnv('DISCORD_SCOPES', 'identify email guilds.join');
 const INVITE_URL = cleanEnv('DISCORD_INVITE_URL');
 const LOG_WEBHOOK = cleanEnv('DISCORD_LOG_WEBHOOK_URL');
@@ -37,6 +37,23 @@ const SUCCESS_REDIRECT_URL = cleanEnv('SUCCESS_REDIRECT_URL');
 const STATE_SECRET = firstEnv(['OAUTH_STATE_SECRET', 'AUTH_STATE_SECRET', 'JWT_SECRET'], CLIENT_SECRET || BOT_TOKEN || 'tempeststore-state-secret');
 const REDIRECT_URI = firstEnv(['DISCORD_REDIRECT_URI', 'AUTH_REDIRECT_URI'], `${PUBLIC_URL}/auth/discord/callback`).replace(/\/$/, '');
 const MONGO_URI = firstEnv(['MONGO_URI', 'MONGODB_URI', 'DATABASE_URL']);
+
+// Mensagem temporaria no canal #verifique-se depois do OAuth.
+// Defaults pedidos pelo cliente, mas pode sobrescrever pela Vercel sem editar codigo.
+const VERIFY_STATUS_CHANNEL_ID = firstEnv([
+  'VERIFY_STATUS_CHANNEL_ID',
+  'AUTH_STATUS_CHANNEL_ID',
+  'DISCORD_VERIFY_CHANNEL_ID',
+  'DISCORD_VERIFICATION_CHANNEL_ID'
+], '1508197311866736821');
+const STORE_CHANNEL_ID = firstEnv([
+  'STORE_CHANNEL_ID',
+  'SHOP_CHANNEL_ID',
+  'LOJA_CHANNEL_ID',
+  'DISCORD_STORE_CHANNEL_ID'
+], '1519861969606279331');
+const VERIFY_STATUS_DELETE_MS = Math.max(1000, Number(firstEnv(['VERIFY_STATUS_DELETE_MS', 'AUTH_STATUS_DELETE_MS'], '5000')) || 5000);
+
 const REQUIRED_SCOPES = ['identify', 'guilds.join'];
 let mongoConnectionPromise = null;
 
@@ -284,12 +301,19 @@ function readState(state) {
 
 function describeDiscordHttpError(url, status, data = {}) {
   const base = data.error_description || data.message || data.error || `Discord retornou ${status}`;
+  const code = data.code ? ` codigo ${data.code}` : '';
   const target = String(url || '');
   if (status === 401 && target.includes('/oauth2/token')) {
     return 'Discord retornou 401 no token OAuth. Confira se o DISCORD_CLIENT_SECRET da Vercel é o secret ATUAL deste app e se o Redirect URI é exatamente o mesmo cadastrado no Discord.';
   }
   if (status === 401 && target.includes('/guilds/')) {
     return 'Discord retornou 401 ao puxar o membro/aplicar cargo. Configure SITE_DISCORD_BOT_TOKEN ou DISCORD_BOT_TOKEN na Vercel com o token ATUAL do bot, depois faça redeploy.';
+  }
+  if (status === 403 && target.includes('/roles/')) {
+    return `Discord retornou 403 ao aplicar o cargo${code}. O bot não tem permissão ou o cargo verificado está acima/igual ao maior cargo do bot. Coloque o cargo do bot acima do cargo 1508197241696026817 e habilite Manage Roles.`;
+  }
+  if (status === 404 && target.includes('/roles/')) {
+    return `Discord retornou 404 ao aplicar o cargo${code}. Confira se DISCORD_VERIFIED_ROLE_ID está com o ID correto do cargo no mesmo servidor: 1508197241696026817.`;
   }
   return base;
 }
@@ -365,8 +389,64 @@ async function notifyWebhook(user, req, result) {
   }
 }
 
+async function fetchGuildMemberRoles(guildId, userId) {
+  if (!BOT_TOKEN || !guildId || !userId) return [];
+  try {
+    const member = await discordFetch(`https://discord.com/api/v10/guilds/${guildId}/members/${userId}`, {
+      headers: { Authorization: `Bot ${BOT_TOKEN}` }
+    });
+    return Array.isArray(member.roles) ? member.roles.map(String) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function scheduleTemporaryMessageDelete(channelId, messageId, deleteMs = VERIFY_STATUS_DELETE_MS) {
+  if (!BOT_TOKEN || !channelId || !messageId) return;
+  setTimeout(() => {
+    discordFetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bot ${BOT_TOKEN}` }
+    }).catch((error) => {
+      console.warn('[VerifyStatus] Falha ao apagar mensagem temporaria:', error.message || error);
+    });
+  }, deleteMs);
+}
+
+async function sendVerifyStatusMessage({ guildId, user, alreadyVerified, roleApplied }) {
+  const channelId = VERIFY_STATUS_CHANNEL_ID;
+  if (!BOT_TOKEN || !channelId || !user?.id) return { ok: false, skipped: true };
+
+  const mention = `<@${user.id}>`;
+  const storeMention = STORE_CHANNEL_ID ? `<#${STORE_CHANNEL_ID}>` : 'a loja';
+  const content = alreadyVerified
+    ? `${mention} ✅ **Você já está verificado.**`
+    : (roleApplied
+      ? `${mention} ✅ **Sucesso na verificação!** Já pode entrar na loja: ${storeMention}`
+      : `${mention} ⚠️ **Verificação concluída**, mas o cargo não foi aplicado. Chame o suporte.`);
+
+  try {
+    const msg = await discordFetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bot ${BOT_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        content,
+        allowed_mentions: { users: [String(user.id)], roles: [], parse: [] }
+      })
+    });
+    scheduleTemporaryMessageDelete(channelId, msg.id);
+    return { ok: true, messageId: msg.id, guildId };
+  } catch (error) {
+    console.warn('[VerifyStatus] Falha ao enviar mensagem temporaria:', error.data || error.message || error);
+    return { ok: false, reason: error.message || 'send_failed' };
+  }
+}
+
 async function joinGuildAndApplyRole({ guildId, userId, accessToken }) {
-  const result = { guildId, joined: false, roleApplied: false, roleError: '' };
+  const result = { guildId, joined: false, roleApplied: false, alreadyVerified: false, roleError: '' };
 
   if (!BOT_TOKEN) throw new Error('DISCORD_BOT_TOKEN não configurado na Vercel.');
   if (!guildId) throw new Error('DISCORD_GUILD_ID não configurado.');
@@ -385,6 +465,13 @@ async function joinGuildAndApplyRole({ guildId, userId, accessToken }) {
   result.joined = true;
 
   if (VERIFIED_ROLE_ID) {
+    const rolesBefore = await fetchGuildMemberRoles(guildId, userId);
+    if (rolesBefore.includes(String(VERIFIED_ROLE_ID))) {
+      result.roleApplied = true;
+      result.alreadyVerified = true;
+      return result;
+    }
+
     try {
       await discordFetch(`https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${VERIFIED_ROLE_ID}`, {
         method: 'PUT',
@@ -392,7 +479,9 @@ async function joinGuildAndApplyRole({ guildId, userId, accessToken }) {
       });
       result.roleApplied = true;
     } catch (error) {
-      result.roleError = error.message || 'Falha ao aplicar cargo.';
+      const rawMessage = error.data?.message || error.data?.error || error.message || 'Falha ao aplicar cargo.';
+      const rawCode = error.data?.code ? ` codigo ${error.data.code}` : '';
+      result.roleError = error.message || `${rawMessage}${rawCode}`;
       console.warn('[Role] Falha ao aplicar cargo:', error.data || error.message || error);
     }
   }
@@ -469,6 +558,9 @@ app.get('/health', (_req, res) => res.json({
   mongo_configured: !!MONGO_URI,
   oauth_state_secret_configured: !!firstEnv(['OAUTH_STATE_SECRET', 'AUTH_STATE_SECRET']),
   state_recovery_enabled: true,
+  verify_status_channel_id: VERIFY_STATUS_CHANNEL_ID,
+  store_channel_id: STORE_CHANNEL_ID,
+  verify_status_delete_ms: VERIFY_STATUS_DELETE_MS,
   required_scopes: REQUIRED_SCOPES
 }));
 
@@ -577,9 +669,15 @@ async function handleAuthCallback(req, res) {
       mongoSaved: mongoResult.ok,
       mongoSkipped: mongoResult.skipped
     });
+    await sendVerifyStatusMessage({
+      guildId,
+      user,
+      alreadyVerified: !!joinResult.alreadyVerified,
+      roleApplied: !!joinResult.roleApplied
+    });
 
     let roleMsg = VERIFIED_ROLE_ID
-      ? (joinResult.roleApplied ? 'O cargo de verificado foi aplicado.' : 'Você entrou no servidor, mas o cargo não foi aplicado. Confira a posição do cargo do bot.')
+      ? (joinResult.alreadyVerified ? 'Você já estava verificado.' : (joinResult.roleApplied ? 'O cargo de verificado foi aplicado.' : `Você entrou no servidor, mas o cargo não foi aplicado. Motivo: ${joinResult.roleError || 'confira a posição do cargo do bot.'}`))
       : 'Você foi autenticado e redirecionado para o servidor.';
     if (!mongoResult.ok) {
       roleMsg += ` A autenticação funcionou, mas não consegui salvar no MongoDB (${mongoResult.reason}). Configure o MONGO_URI da Vercel igual ao do bot para o botão Validar reconhecer esta autorização.`;
