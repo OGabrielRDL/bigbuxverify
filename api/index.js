@@ -53,9 +53,14 @@ const STORE_CHANNEL_ID = firstEnv([
   'DISCORD_STORE_CHANNEL_ID'
 ], '1519861969606279331');
 const VERIFY_STATUS_DELETE_MS = Math.max(1000, Number(firstEnv(['VERIFY_STATUS_DELETE_MS', 'AUTH_STATUS_DELETE_MS'], '5000')) || 5000);
+const ROLE_APPLY_RETRIES = Math.max(1, Number(firstEnv(['ROLE_APPLY_RETRIES', 'DISCORD_ROLE_APPLY_RETRIES'], '4')) || 4);
+const ROLE_APPLY_RETRY_MS = Math.max(250, Number(firstEnv(['ROLE_APPLY_RETRY_MS', 'DISCORD_ROLE_APPLY_RETRY_MS'], '1200')) || 1200);
+const AUTO_DETECT_GUILD_BY_ROLE = cleanEnv('AUTO_DETECT_GUILD_BY_ROLE', 'true') !== 'false';
 
 const REQUIRED_SCOPES = ['identify', 'guilds.join'];
 let mongoConnectionPromise = null;
+let detectedGuildIdCache = '';
+let detectedGuildCheckedAt = 0;
 
 app.disable('x-powered-by');
 app.use(express.json());
@@ -255,7 +260,10 @@ function decodeStatePayload(payload) {
 function isAllowedStateGuild(guildId) {
   const expected = String(DEFAULT_GUILD_ID || '').trim();
   const received = String(guildId || '').trim();
-  return Boolean(received) && (!expected || received === expected);
+  if (!received) return false;
+  if (!expected || received === expected) return true;
+  if (AUTO_DETECT_GUILD_BY_ROLE && detectedGuildIdCache && received === detectedGuildIdCache) return true;
+  return AUTO_DETECT_GUILD_BY_ROLE;
 }
 
 function readState(state) {
@@ -332,6 +340,70 @@ async function discordFetch(url, options = {}) {
   return data;
 }
 
+async function roleExistsInGuild(guildId) {
+  if (!BOT_TOKEN || !guildId || !VERIFIED_ROLE_ID) return false;
+  try {
+    const roles = await discordFetch(`https://discord.com/api/v10/guilds/${guildId}/roles`, {
+      headers: { Authorization: `Bot ${BOT_TOKEN}` }
+    });
+    return Array.isArray(roles) && roles.some(role => String(role.id) === String(VERIFIED_ROLE_ID));
+  } catch (_) {
+    return false;
+  }
+}
+
+async function botIsMemberOfGuild(guildId) {
+  if (!BOT_TOKEN || !guildId) return false;
+  try {
+    const botUser = await discordFetch('https://discord.com/api/v10/users/@me', {
+      headers: { Authorization: `Bot ${BOT_TOKEN}` }
+    });
+    await discordFetch(`https://discord.com/api/v10/guilds/${guildId}/members/${botUser.id}`, {
+      headers: { Authorization: `Bot ${BOT_TOKEN}` }
+    });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function findGuildWithVerifiedRole() {
+  if (!AUTO_DETECT_GUILD_BY_ROLE || !BOT_TOKEN || !VERIFIED_ROLE_ID) return '';
+  if (detectedGuildIdCache && Date.now() - detectedGuildCheckedAt < 5 * 60 * 1000) return detectedGuildIdCache;
+
+  detectedGuildCheckedAt = Date.now();
+  try {
+    const guilds = await discordFetch('https://discord.com/api/v10/users/@me/guilds', {
+      headers: { Authorization: `Bot ${BOT_TOKEN}` }
+    });
+    if (!Array.isArray(guilds)) return '';
+
+    for (const guild of guilds) {
+      if (await roleExistsInGuild(guild.id)) {
+        detectedGuildIdCache = String(guild.id);
+        return detectedGuildIdCache;
+      }
+    }
+  } catch (error) {
+    console.warn('[OAuth2] Falha ao auto-detectar servidor pelo cargo:', error.message || error);
+  }
+
+  return '';
+}
+
+async function resolveOAuthGuildId(preferredGuildId = DEFAULT_GUILD_ID) {
+  const preferred = String(preferredGuildId || '').trim();
+  if (!AUTO_DETECT_GUILD_BY_ROLE) return preferred;
+
+  if (preferred && await botIsMemberOfGuild(preferred) && (!VERIFIED_ROLE_ID || await roleExistsInGuild(preferred))) {
+    detectedGuildIdCache = preferred;
+    detectedGuildCheckedAt = Date.now();
+    return preferred;
+  }
+
+  return await findGuildWithVerifiedRole() || preferred;
+}
+
 async function exchangeDiscordOAuthCode(code) {
   const basic = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
   return discordFetch('https://discord.com/api/oauth2/token', {
@@ -401,16 +473,30 @@ async function fetchGuildMemberRoles(guildId, userId) {
   }
 }
 
-function scheduleTemporaryMessageDelete(channelId, messageId, deleteMs = VERIFY_STATUS_DELETE_MS) {
-  if (!BOT_TOKEN || !channelId || !messageId) return;
-  setTimeout(() => {
-    discordFetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bot ${BOT_TOKEN}` }
-    }).catch((error) => {
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function deleteTemporaryMessageAfterDelay(channelId, messageId, deleteMs = VERIFY_STATUS_DELETE_MS) {
+  if (!BOT_TOKEN || !channelId || !messageId) return { ok: false, skipped: true };
+
+  await wait(deleteMs);
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await discordFetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bot ${BOT_TOKEN}` }
+      });
+      return { ok: true };
+    } catch (error) {
+      if (error.status === 404) return { ok: true, alreadyDeleted: true };
       console.warn('[VerifyStatus] Falha ao apagar mensagem temporaria:', error.message || error);
-    });
-  }, deleteMs);
+      if (attempt < 3) await wait(750);
+    }
+  }
+
+  return { ok: false };
 }
 
 async function sendVerifyStatusMessage({ guildId, user, alreadyVerified, roleApplied }) {
@@ -437,12 +523,43 @@ async function sendVerifyStatusMessage({ guildId, user, alreadyVerified, roleApp
         allowed_mentions: { users: [String(user.id)], roles: [], parse: [] }
       })
     });
-    scheduleTemporaryMessageDelete(channelId, msg.id);
-    return { ok: true, messageId: msg.id, guildId };
+    const deleteResult = await deleteTemporaryMessageAfterDelay(channelId, msg.id);
+    return { ok: true, messageId: msg.id, guildId, deleted: !!deleteResult.ok };
   } catch (error) {
     console.warn('[VerifyStatus] Falha ao enviar mensagem temporaria:', error.data || error.message || error);
     return { ok: false, reason: error.message || 'send_failed' };
   }
+}
+
+async function applyVerifiedRoleWithRetry(guildId, userId) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= ROLE_APPLY_RETRIES; attempt++) {
+    try {
+      await discordFetch(`https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${VERIFIED_ROLE_ID}`, {
+        method: 'PUT',
+        headers: { Authorization: `Bot ${BOT_TOKEN}` }
+      });
+
+      await wait(350);
+      const rolesAfter = await fetchGuildMemberRoles(guildId, userId);
+      if (!rolesAfter.length || rolesAfter.includes(String(VERIFIED_ROLE_ID))) {
+        return { ok: true };
+      }
+
+      lastError = new Error('Discord aceitou a requisicao, mas o cargo ainda nao apareceu no membro.');
+    } catch (error) {
+      lastError = error;
+      const retryable = error.status === 404 || error.status === 429 || error.status >= 500;
+      if (!retryable) break;
+    }
+
+    if (attempt < ROLE_APPLY_RETRIES) {
+      await wait(ROLE_APPLY_RETRY_MS);
+    }
+  }
+
+  return { ok: false, error: lastError };
 }
 
 async function joinGuildAndApplyRole({ guildId, userId, accessToken }) {
@@ -473,10 +590,8 @@ async function joinGuildAndApplyRole({ guildId, userId, accessToken }) {
     }
 
     try {
-      await discordFetch(`https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${VERIFIED_ROLE_ID}`, {
-        method: 'PUT',
-        headers: { Authorization: `Bot ${BOT_TOKEN}` }
-      });
+      const applied = await applyVerifiedRoleWithRetry(guildId, userId);
+      if (!applied.ok) throw applied.error || new Error('Falha ao aplicar cargo.');
       result.roleApplied = true;
     } catch (error) {
       const rawMessage = error.data?.message || error.data?.error || error.message || 'Falha ao aplicar cargo.';
@@ -495,7 +610,7 @@ function getReturnUrl(guildId) {
 
 
 function authRestartUrl(guildId = '') {
-  const gid = String(guildId || DEFAULT_GUILD_ID || '').trim();
+  const gid = String(guildId || detectedGuildIdCache || DEFAULT_GUILD_ID || '').trim();
   return gid ? `/auth/discord?guildId=${encodeURIComponent(gid)}&prompt=consent` : '/auth/discord';
 }
 
@@ -545,28 +660,36 @@ function renderResultPage({ ok, title, message, user, guildId }) {
 </html>`;
 }
 
-app.get('/health', (_req, res) => res.json({
-  ok: true,
-  service: 'BigBux Verify',
-  public_url: PUBLIC_URL,
-  redirect_uri: REDIRECT_URI,
-  guild_id: DEFAULT_GUILD_ID,
-  client_id_configured: !!CLIENT_ID,
-  client_secret_configured: !!CLIENT_SECRET,
-  bot_token_configured: !!BOT_TOKEN,
-  verified_role_configured: !!VERIFIED_ROLE_ID,
-  mongo_configured: !!MONGO_URI,
-  oauth_state_secret_configured: !!firstEnv(['OAUTH_STATE_SECRET', 'AUTH_STATE_SECRET']),
-  state_recovery_enabled: true,
-  verify_status_channel_id: VERIFY_STATUS_CHANNEL_ID,
-  store_channel_id: STORE_CHANNEL_ID,
-  verify_status_delete_ms: VERIFY_STATUS_DELETE_MS,
-  required_scopes: REQUIRED_SCOPES
-}));
+app.get('/health', async (_req, res) => {
+  const resolvedGuildId = await resolveOAuthGuildId(DEFAULT_GUILD_ID).catch(() => DEFAULT_GUILD_ID);
+  res.json({
+    ok: true,
+    service: 'BigBux Verify',
+    public_url: PUBLIC_URL,
+    redirect_uri: REDIRECT_URI,
+    guild_id: resolvedGuildId,
+    configured_guild_id: DEFAULT_GUILD_ID,
+    guild_auto_detect_enabled: AUTO_DETECT_GUILD_BY_ROLE,
+    guild_auto_detected: Boolean(resolvedGuildId && resolvedGuildId !== DEFAULT_GUILD_ID),
+    client_id_configured: !!CLIENT_ID,
+    client_secret_configured: !!CLIENT_SECRET,
+    bot_token_configured: !!BOT_TOKEN,
+    verified_role_configured: !!VERIFIED_ROLE_ID,
+    mongo_configured: !!MONGO_URI,
+    oauth_state_secret_configured: !!firstEnv(['OAUTH_STATE_SECRET', 'AUTH_STATE_SECRET']),
+    state_recovery_enabled: true,
+    verify_status_channel_id: VERIFY_STATUS_CHANNEL_ID,
+    store_channel_id: STORE_CHANNEL_ID,
+    verify_status_delete_ms: VERIFY_STATUS_DELETE_MS,
+    role_apply_retries: ROLE_APPLY_RETRIES,
+    role_apply_retry_ms: ROLE_APPLY_RETRY_MS,
+    required_scopes: REQUIRED_SCOPES
+  });
+});
 
 app.get('/auth', (_req, res) => res.redirect('/'));
 
-app.get('/auth/discord', (req, res) => {
+app.get('/auth/discord', async (req, res) => {
   if (!CLIENT_ID || !CLIENT_SECRET) {
     return res.status(500).send(renderResultPage({
       ok: false,
@@ -575,7 +698,7 @@ app.get('/auth/discord', (req, res) => {
     }));
   }
 
-  const guildId = String(req.query.guildId || DEFAULT_GUILD_ID || '').trim();
+  const guildId = await resolveOAuthGuildId(String(req.query.guildId || DEFAULT_GUILD_ID || '').trim());
   if (!guildId) {
     return res.status(500).send(renderResultPage({
       ok: false,
@@ -628,7 +751,7 @@ async function handleAuthCallback(req, res) {
         recoveryReason: 'callback_state_error'
       };
     }
-    const guildId = parsedState.guildId;
+    const guildId = await resolveOAuthGuildId(parsedState.guildId);
 
     const token = await exchangeDiscordOAuthCode(code);
 
